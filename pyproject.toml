@@ -1,0 +1,10 @@
+[project]
+name = "yt-dlp-gui"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "imageio-ffmpeg>=0.6.0",
+    "pyqt6>=6.10",
+    "yt-dlp>=2026.2.4",
+]
