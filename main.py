@@ -22,6 +22,7 @@ _DEST_RE = re.compile(r"\[(?:download|Merger)\].*?Destination:\s*(.+)")
 _FRAG_RE = re.compile(r"\[download\]\s+(.+\.part)")
 _MERGE_RE = re.compile(r"\[Merger\]")
 _ALREADY_RE = re.compile(r"has already been downloaded")
+_LIVE_RE = re.compile(r"\[download\]\s+([\d.]+\s*[KMG]?iB)\s+at\s+([\d.]+\s*[KMG]?iB/s)")
 _CHATURBOT_RE = re.compile(r"https?://(?:www\.)?chaturbot\.co/")
 
 
@@ -126,8 +127,14 @@ class DownloadWorker(QThread):
                     speed_m = _SPEED_RE.search(line)
                     speed = speed_m.group(1) if speed_m else ""
                     self.progress.emit(self.row, pct, f"Downloading  {speed}")
-                elif line.startswith("ERROR"):
-                    last_error = line
+                else:
+                    # livestream: no percentage, just size + speed
+                    live_m = _LIVE_RE.search(line)
+                    if live_m:
+                        size, speed = live_m.group(1), live_m.group(2)
+                        self.progress.emit(self.row, 0, f"Recording {size}  {speed}")
+                    elif line.startswith("ERROR"):
+                        last_error = line
 
             self._proc.wait()
             rc = self._proc.returncode
@@ -249,7 +256,11 @@ class MainWindow(QMainWindow):
     def _start_download(self, row: int):
         item = self.downloads[row]
         item.status = "Starting…"
+        item.percent = 0
         self.table.item(row, 1).setText("Starting…")
+        bar: QProgressBar = self.table.cellWidget(row, 2)
+        bar.setValue(0)
+        self.table.item(row, 3).setText("")
 
         worker = DownloadWorker(row, item.url, self.output_dir)
         item.worker = worker
@@ -314,6 +325,7 @@ class MainWindow(QMainWindow):
         if item.status in ("Error", "Pending", "Stopped"):
             menu.addAction("Retry", lambda: self._start_download(row))
         if item.status == "Done":
+            menu.addAction("Retry", lambda: self._start_download(row))
             menu.addAction("Open file location", lambda: self._open_folder())
         menu.addAction("Remove", lambda: self._remove_row(row))
         menu.exec(self.table.viewport().mapToGlobal(pos))
