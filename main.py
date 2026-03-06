@@ -22,7 +22,7 @@ _DEST_RE = re.compile(r"\[(?:download|Merger)\].*?Destination:\s*(.+)")
 _FRAG_RE = re.compile(r"\[download\]\s+(.+\.part)")
 _MERGE_RE = re.compile(r"\[Merger\]")
 _ALREADY_RE = re.compile(r"has already been downloaded")
-_LIVE_RE = re.compile(r"\[download\]\s+([\d.]+\s*[KMG]?iB)\s+at\s+([\d.]+\s*[KMG]?iB/s)")
+_LIVE_RE = re.compile(r"size=\s*(\d+\S+)\s+.*?time=(\d{2}:\d{2}:\d{2})")
 _CHATURBOT_RE = re.compile(r"https?://(?:www\.)?chaturbot\.co/")
 
 
@@ -128,11 +128,11 @@ class DownloadWorker(QThread):
                     speed = speed_m.group(1) if speed_m else ""
                     self.progress.emit(self.row, pct, f"Downloading  {speed}")
                 else:
-                    # livestream: no percentage, just size + speed
+                    # livestream: ffmpeg outputs size + time instead of percentage
                     live_m = _LIVE_RE.search(line)
                     if live_m:
-                        size, speed = live_m.group(1), live_m.group(2)
-                        self.progress.emit(self.row, 0, f"Recording {size}  {speed}")
+                        size, time_ = live_m.group(1), live_m.group(2)
+                        self.progress.emit(self.row, 0, f"Recording {time_}  {size}")
                     elif line.startswith("ERROR"):
                         last_error = line
 
@@ -193,7 +193,7 @@ class MainWindow(QMainWindow):
 
         # --- Download table ---
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Title / URL", "Status", "Progress", "Speed"])
+        self.table.setHorizontalHeaderLabels(["Title / URL", "Status", "Progress", "Total Downloaded"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
