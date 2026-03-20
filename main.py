@@ -3,8 +3,12 @@ import signal
 import sys
 import os
 import subprocess
+import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import shutil
 
 import imageio_ffmpeg
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -15,7 +19,7 @@ from PyQt6.QtWidgets import (
     QMenu, QMessageBox,
 )
 
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+FFMPEG_PATH = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
 _PCT_RE = re.compile(r"(\d+(?:\.\d+)?)%")
 _SPEED_RE = re.compile(r"(\d+(?:\.\d+)?\s*[KMG]?iB/s)")
 _DEST_RE = re.compile(r"\[(?:download|Merger)\].*?Destination:\s*(.+)")
@@ -32,7 +36,7 @@ def _normalize_url(url: str) -> str:
 
 class DownloadWorker(QThread):
     progress = pyqtSignal(int, float, str)   # row, percent, status_text
-    finished = pyqtSignal(int, bool, str)     # row, success, message
+    done = pyqtSignal(int, bool, str)           # row, success, message
 
     def __init__(self, row: int, url: str, output_dir: str):
         super().__init__()
@@ -84,6 +88,7 @@ class DownloadWorker(QThread):
         title = ""
         dest_path = ""
         last_error = ""
+        last_live_emit = 0.0
 
         try:
             popen_kwargs = dict(
@@ -131,6 +136,10 @@ class DownloadWorker(QThread):
                     # livestream: ffmpeg outputs size + time instead of percentage
                     live_m = _LIVE_RE.search(line)
                     if live_m:
+                        now = time.monotonic()
+                        if now - last_live_emit < 1.0:
+                            continue
+                        last_live_emit = now
                         size, time_ = live_m.group(1), live_m.group(2)
                         self.progress.emit(self.row, 0, f"Recording {time_}  {size}")
                     elif line.startswith("ERROR"):
@@ -141,15 +150,15 @@ class DownloadWorker(QThread):
             self._proc = None
 
             if rc == 0:
-                self.finished.emit(self.row, True, title or self.url)
+                self.done.emit(self.row, True, title or self.url)
             elif rc < 0 or last_error == "":
                 # killed — rename .part to usable file
                 self._finalize_partial(dest_path)
-                self.finished.emit(self.row, False, "Stopped")
+                self.done.emit(self.row, False, "Stopped")
             else:
-                self.finished.emit(self.row, False, last_error)
+                self.done.emit(self.row, False, last_error)
         except Exception as e:
-            self.finished.emit(self.row, False, str(e))
+            self.done.emit(self.row, False, str(e))
 
 
 @dataclass
@@ -265,44 +274,63 @@ class MainWindow(QMainWindow):
         worker = DownloadWorker(row, item.url, self.output_dir)
         item.worker = worker
         worker.progress.connect(self._on_progress)
-        worker.finished.connect(self._on_finished)
+        worker.done.connect(self._on_finished)
         worker.start()
 
     def _on_progress(self, row: int, percent: float, status_text: str):
-        if row >= len(self.downloads):
-            return
-        item = self.downloads[row]
-        item.percent = percent
-        item.status = status_text
+        try:
+            if row >= len(self.downloads):
+                return
+            item = self.downloads[row]
+            item.percent = percent
+            item.status = status_text
 
-        self.table.item(row, 1).setText(status_text.split("  ")[0])
-        bar: QProgressBar = self.table.cellWidget(row, 2)
-        bar.setValue(int(percent))
-        # speed is after the double-space
-        parts = status_text.split("  ")
-        speed = parts[1] if len(parts) > 1 else ""
-        self.table.item(row, 3).setText(speed)
+            status_item = self.table.item(row, 1)
+            speed_item = self.table.item(row, 3)
+            bar: QProgressBar = self.table.cellWidget(row, 2)
+            if not status_item or not speed_item or not bar:
+                return
+
+            status_item.setText(status_text.split("  ")[0])
+            bar.setValue(int(percent))
+            # speed is after the double-space
+            parts = status_text.split("  ")
+            speed = parts[1] if len(parts) > 1 else ""
+            speed_item.setText(speed)
+        except Exception:
+            traceback.print_exc()
 
     def _on_finished(self, row: int, success: bool, message: str):
-        if row >= len(self.downloads):
-            return
-        item = self.downloads[row]
-        item.worker = None
-        if success:
-            item.status = "Done"
-            item.title = message
-            self.table.item(row, 0).setText(message)
-            self.table.item(row, 1).setText("Done")
+        try:
+            if row >= len(self.downloads):
+                return
+            item = self.downloads[row]
+            item.worker = None
+
+            title_item = self.table.item(row, 0)
+            status_item = self.table.item(row, 1)
+            speed_item = self.table.item(row, 3)
             bar: QProgressBar = self.table.cellWidget(row, 2)
-            bar.setValue(100)
-        elif message == "Stopped":
-            item.status = "Stopped"
-            self.table.item(row, 1).setText("Stopped")
-        else:
-            item.status = "Error"
-            self.table.item(row, 1).setText("Error")
-            self.table.item(row, 1).setToolTip(message)
-        self.table.item(row, 3).setText("")
+            if not title_item or not status_item or not speed_item:
+                return
+
+            if success:
+                item.status = "Done"
+                item.title = message
+                title_item.setText(message)
+                status_item.setText("Done")
+                if bar:
+                    bar.setValue(100)
+            elif message == "Stopped":
+                item.status = "Stopped"
+                status_item.setText("Stopped")
+            else:
+                item.status = "Error"
+                status_item.setText("Error")
+                status_item.setToolTip(message)
+            speed_item.setText("")
+        except Exception:
+            traceback.print_exc()
 
     def _clear_finished(self):
         rows_to_remove = [r for r, item in enumerate(self.downloads) if item.status == "Done"]
@@ -329,6 +357,17 @@ class MainWindow(QMainWindow):
             menu.addAction("Open file location", lambda: self._open_folder())
         menu.addAction("Remove", lambda: self._remove_row(row))
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def closeEvent(self, event):
+        # Stop all running workers and wait for them to finish so QThread
+        # objects are not destroyed while still running (causes segfault).
+        for item in self.downloads:
+            if item.worker and item.worker.isRunning():
+                item.worker.cancel()
+        for item in self.downloads:
+            if item.worker and item.worker.isRunning():
+                item.worker.wait(5000)
+        event.accept()
 
     def _open_folder(self):
         if sys.platform == "win32":
@@ -360,7 +399,12 @@ class MainWindow(QMainWindow):
                 it.worker.row = r
 
 
+def _excepthook(exc_type, exc_value, exc_tb):
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+
+
 if __name__ == "__main__":
+    sys.excepthook = _excepthook
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
