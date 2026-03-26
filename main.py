@@ -35,12 +35,11 @@ def _normalize_url(url: str) -> str:
 
 
 class DownloadWorker(QThread):
-    progress = pyqtSignal(int, float, str)   # row, percent, status_text
-    done = pyqtSignal(int, bool, str)           # row, success, message
+    progress = pyqtSignal(float, str)   # percent, status_text
+    done = pyqtSignal(bool, str)        # success, message
 
-    def __init__(self, row: int, url: str, output_dir: str):
+    def __init__(self, url: str, output_dir: str):
         super().__init__()
-        self.row = row
         self.url = url
         self.output_dir = output_dir
         self._proc: subprocess.Popen | None = None
@@ -64,13 +63,16 @@ class DownloadWorker(QThread):
     def cancel(self):
         if self._proc and self._proc.poll() is None:
             # Kill the entire process tree (yt-dlp + ffmpeg child)
-            if sys.platform == "win32":
-                subprocess.call(
-                    ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            else:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+            try:
+                if sys.platform == "win32":
+                    subprocess.call(
+                        ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                else:
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
     def run(self):
         outtmpl = os.path.join(self.output_dir, "%(title)s.%(ext)s")
@@ -84,7 +86,7 @@ class DownloadWorker(QThread):
             self.url,
         ]
 
-        self.progress.emit(self.row, 0, "Starting…")
+        self.progress.emit(0, "Starting…")
         title = ""
         dest_path = ""
         last_error = ""
@@ -122,7 +124,7 @@ class DownloadWorker(QThread):
                     title = title or self.url
 
                 if _MERGE_RE.search(line):
-                    self.progress.emit(self.row, 100, "Merging…")
+                    self.progress.emit(100, "Merging…")
                     continue
 
                 # parse progress percentage + speed
@@ -131,7 +133,7 @@ class DownloadWorker(QThread):
                     pct = float(pct_m.group(1))
                     speed_m = _SPEED_RE.search(line)
                     speed = speed_m.group(1) if speed_m else ""
-                    self.progress.emit(self.row, pct, f"Downloading  {speed}")
+                    self.progress.emit(pct, f"Downloading  {speed}")
                 else:
                     # livestream: ffmpeg outputs size + time instead of percentage
                     live_m = _LIVE_RE.search(line)
@@ -141,7 +143,7 @@ class DownloadWorker(QThread):
                             continue
                         last_live_emit = now
                         size, time_ = live_m.group(1), live_m.group(2)
-                        self.progress.emit(self.row, 0, f"Recording {time_}  {size}")
+                        self.progress.emit(0, f"Recording {time_}  {size}")
                     elif line.startswith("ERROR"):
                         last_error = line
 
@@ -150,15 +152,15 @@ class DownloadWorker(QThread):
             self._proc = None
 
             if rc == 0:
-                self.done.emit(self.row, True, title or self.url)
+                self.done.emit(True, title or self.url)
             elif rc < 0 or last_error == "":
                 # killed — rename .part to usable file
                 self._finalize_partial(dest_path)
-                self.done.emit(self.row, False, "Stopped")
+                self.done.emit(False, "Stopped")
             else:
-                self.done.emit(self.row, False, last_error)
+                self.done.emit(False, last_error)
         except Exception as e:
-            self.done.emit(self.row, False, str(e))
+            self.done.emit(False, str(e))
 
 
 @dataclass
@@ -271,17 +273,24 @@ class MainWindow(QMainWindow):
         bar.setValue(0)
         self.table.item(row, 3).setText("")
 
-        worker = DownloadWorker(row, item.url, self.output_dir)
+        worker = DownloadWorker(item.url, self.output_dir)
         item.worker = worker
         worker.progress.connect(self._on_progress)
         worker.done.connect(self._on_finished)
         worker.start()
 
-    def _on_progress(self, row: int, percent: float, status_text: str):
+    def _find_row_for_worker(self, worker: DownloadWorker) -> tuple[int, DownloadItem] | None:
+        for r, item in enumerate(self.downloads):
+            if item.worker is worker:
+                return r, item
+        return None
+
+    def _on_progress(self, percent: float, status_text: str):
         try:
-            if row >= len(self.downloads):
+            result = self._find_row_for_worker(self.sender())
+            if result is None:
                 return
-            item = self.downloads[row]
+            row, item = result
             item.percent = percent
             item.status = status_text
 
@@ -300,12 +309,17 @@ class MainWindow(QMainWindow):
         except Exception:
             traceback.print_exc()
 
-    def _on_finished(self, row: int, success: bool, message: str):
+    def _on_finished(self, success: bool, message: str):
         try:
-            if row >= len(self.downloads):
+            worker = self.sender()
+            result = self._find_row_for_worker(worker)
+            if result is None:
                 return
-            item = self.downloads[row]
+            row, item = result
             item.worker = None
+            # Keep a reference until the thread fully stops so Qt doesn't
+            # destroy the QThread while run() is still on the call stack.
+            worker.finished.connect(worker.deleteLater)
 
             title_item = self.table.item(row, 0)
             status_item = self.table.item(row, 1)
@@ -337,10 +351,6 @@ class MainWindow(QMainWindow):
         for row in reversed(rows_to_remove):
             self.table.removeRow(row)
             self.downloads.pop(row)
-        # fix row references for active workers
-        for r, item in enumerate(self.downloads):
-            if item.worker:
-                item.worker.row = r
 
     def _context_menu(self, pos):
         row = self.table.rowAt(pos.y())
@@ -394,9 +404,6 @@ class MainWindow(QMainWindow):
             return
         self.table.removeRow(row)
         self.downloads.pop(row)
-        for r, it in enumerate(self.downloads):
-            if it.worker:
-                it.worker.row = r
 
 
 def _excepthook(exc_type, exc_value, exc_tb):
