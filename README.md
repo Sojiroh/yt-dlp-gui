@@ -2,7 +2,7 @@
 
 A lightweight desktop application that provides a graphical interface for [yt-dlp](https://github.com/yt-dlp/yt-dlp), the popular command-line video downloader. Built with PyQt6, it lets you download videos from thousands of supported sites without touching the terminal.
 
-Current version: **0.1.2**
+Current version: **0.1.3**
 
 ## Features
 
