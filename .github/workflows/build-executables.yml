@@ -1,0 +1,141 @@
+name: Build executables
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: Linux
+            artifact_suffix: linux-x64
+          - os: windows-latest
+            label: Windows
+            artifact_suffix: windows-x64
+          - os: macos-latest
+            label: macOS
+            artifact_suffix: macos
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Read project metadata
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          data = tomllib.loads(Path('pyproject.toml').read_text())
+          name = data['project']['name']
+          version = data['project']['version']
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as fh:
+              fh.write(f'APP_NAME={name}\n')
+              fh.write(f'APP_VERSION={version}\n')
+          PY
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pyqt6 yt-dlp imageio-ffmpeg
+
+      - name: Build app with PyInstaller
+        shell: bash
+        run: pyinstaller --noconfirm --clean main.spec
+
+      - name: Package Linux artifact
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          artifact="dist/${APP_NAME}-${APP_VERSION}-${{ matrix.artifact_suffix }}.tar.gz"
+          if [ -d "dist/${APP_NAME}" ]; then
+            tar -czf "$artifact" -C dist "$APP_NAME"
+          else
+            echo "Expected dist/${APP_NAME} to exist" >&2
+            exit 1
+          fi
+          echo "ARTIFACT_PATH=$artifact" >> "$GITHUB_ENV"
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $artifact = "dist/$env:APP_NAME-$env:APP_VERSION-${{ matrix.artifact_suffix }}.zip"
+          if (Test-Path "dist/$env:APP_NAME") {
+            Compress-Archive -Path "dist/$env:APP_NAME" -DestinationPath $artifact -Force
+          } elseif (Test-Path "dist/$env:APP_NAME.exe") {
+            Compress-Archive -Path "dist/$env:APP_NAME.exe" -DestinationPath $artifact -Force
+          } else {
+            throw "Expected dist/$env:APP_NAME or dist/$env:APP_NAME.exe to exist"
+          }
+          "ARTIFACT_PATH=$artifact" >> $env:GITHUB_ENV
+
+      - name: Package macOS artifact
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          artifact="dist/${APP_NAME}-${APP_VERSION}-${{ matrix.artifact_suffix }}.zip"
+          if [ -d "dist/${APP_NAME}.app" ]; then
+            ditto -c -k --sequesterRsrc --keepParent "dist/${APP_NAME}.app" "$artifact"
+          elif [ -d "dist/${APP_NAME}" ]; then
+            ditto -c -k --keepParent "dist/${APP_NAME}" "$artifact"
+          else
+            echo "Expected dist/${APP_NAME}.app or dist/${APP_NAME} to exist" >&2
+            exit 1
+          fi
+          echo "ARTIFACT_PATH=$artifact" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ env.APP_VERSION }}-${{ matrix.artifact_suffix }}
+          path: ${{ env.ARTIFACT_PATH }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Show downloaded artifacts
+        shell: bash
+        run: |
+          find release-artifacts -type f | sort
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-artifacts/**/*
