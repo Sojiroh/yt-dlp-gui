@@ -15,6 +15,37 @@ on:
   workflow_dispatch:
 
 jobs:
+  tag:
+    name: Auto-tag from pyproject.toml
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.check.outputs.created }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version and create tag if new
+        id: check
+        shell: bash
+        run: |
+          version=$(python3 -c "
+          import tomllib; from pathlib import Path
+          print(tomllib.loads(Path('pyproject.toml').read_text())['project']['version'])
+          ")
+          tag="v${version}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if git ls-remote --tags origin "refs/tags/${tag}" | grep -q "${tag}"; then
+            echo "Tag ${tag} already exists"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag "${tag}"
+            git push origin "${tag}"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
@@ -62,18 +93,20 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller pyqt6 yt-dlp imageio-ffmpeg
+          pip install pyinstaller pyqt6 yt-dlp imageio-ffmpeg certifi
 
       - name: Build app with PyInstaller
         shell: bash
-        run: pyinstaller --noconfirm --clean --name "$APP_NAME" --windowed main.py
+        run: pyinstaller --noconfirm --clean --onefile --name "$APP_NAME" --windowed main.py
 
       - name: Package Linux artifact
         if: runner.os == 'Linux'
         shell: bash
         run: |
           artifact="dist/${APP_NAME}-${APP_VERSION}-${{ matrix.artifact_suffix }}.tar.gz"
-          if [ -d "dist/${APP_NAME}" ]; then
+          if [ -f "dist/${APP_NAME}" ]; then
+            tar -czf "$artifact" -C dist "$APP_NAME"
+          elif [ -d "dist/${APP_NAME}" ]; then
             tar -czf "$artifact" -C dist "$APP_NAME"
           else
             echo "Expected dist/${APP_NAME} to exist" >&2

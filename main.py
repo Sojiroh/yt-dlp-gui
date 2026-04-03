@@ -1,8 +1,14 @@
+import certifi
 import os
 import re
 import subprocess
 import sys
 import time
+
+# PyInstaller bundles don't include system CA certificates, so SSL
+# verification fails unless we point Python at certifi's bundle.
+if not os.environ.get("SSL_CERT_FILE"):
+    os.environ["SSL_CERT_FILE"] = certifi.where()
 import traceback
 import urllib.request
 from dataclasses import dataclass, field

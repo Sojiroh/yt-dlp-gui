@@ -1,6 +1,6 @@
 [project]
 name = "yt-dlp-gui"
-version = "0.1.4"
+version = "0.1.5"
 description = "A PyQt6 desktop GUI for yt-dlp with batch downloads and livestream support"
 requires-python = ">=3.14"
 license = "GPL-3.0-only"
