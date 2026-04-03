@@ -48,6 +48,8 @@ jobs:
 
   build:
     name: ${{ matrix.label }}
+    needs: tag
+    if: always() && (needs.tag.result == 'success' || needs.tag.result == 'skipped')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -152,11 +154,24 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.tag.outputs.created == 'true' || startsWith(github.ref, 'refs/tags/v'))
+    needs: [tag, build]
     runs-on: ubuntu-latest
 
     steps:
+      - name: Resolve tag name
+        id: resolve
+        shell: bash
+        run: |
+          if [[ "${{ needs.tag.outputs.tag }}" != "" ]]; then
+            echo "tag=${{ needs.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -170,5 +185,6 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.resolve.outputs.tag }}
           generate_release_notes: true
           files: release-artifacts/**/*
