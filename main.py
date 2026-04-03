@@ -1,8 +1,7 @@
-import re
-import signal
-import sys
 import os
+import re
 import subprocess
+import sys
 import time
 import traceback
 import urllib.request
@@ -36,18 +35,15 @@ from PyQt6.QtWidgets import (
 from yt_dlp import YoutubeDL
 
 FFMPEG_PATH = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
-_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)%")
-_SPEED_RE = re.compile(r"(\d+(?:\.\d+)?\s*[KMG]?iB/s)")
-_DEST_RE = re.compile(r"\[(?:download|Merger)\].*?Destination:\s*(.+)")
-_FRAG_RE = re.compile(r"\[download\]\s+(.+\.part)")
-_MERGE_RE = re.compile(r"\[Merger\]")
-_ALREADY_RE = re.compile(r"has already been downloaded")
-_LIVE_RE = re.compile(r"size=\s*(\d+\S+)\s+.*?time=(\d{2}:\d{2}:\d{2})")
 _CHATURBOT_RE = re.compile(r"https?://(?:www\.)?chaturbot\.co/")
 
 
 def _normalize_url(url: str) -> str:
     return _CHATURBOT_RE.sub("https://www.chaturbate.com/", url)
+
+
+class _CancelledError(Exception):
+    pass
 
 
 class DownloadWorker(QThread):
@@ -58,141 +54,68 @@ class DownloadWorker(QThread):
         super().__init__()
         self.url = url
         self.output_dir = output_dir
-        self._proc: subprocess.Popen | None = None
-
-    @staticmethod
-    def _finalize_partial(dest_path: str):
-        """Rename .part file to its final name so the recording is usable."""
-        if not dest_path:
-            return
-        part = Path(dest_path)
-        if not part.exists():
-            # yt-dlp may append .part to the destination
-            part = Path(dest_path + ".part")
-        if part.exists() and part.suffix == ".part":
-            final = part.with_suffix("")
-            # if the stem also has no video extension, default to .mp4
-            if final.suffix not in (".mp4", ".mkv", ".webm", ".ts", ".flv"):
-                final = final.with_suffix(".mp4")
-            part.rename(final)
+        self._cancelled = False
 
     def cancel(self):
-        if self._proc and self._proc.poll() is None:
-            # Kill the entire process tree (yt-dlp + ffmpeg child)
-            try:
-                if sys.platform == "win32":
-                    subprocess.call(
-                        ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-                else:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        self._cancelled = True
 
     def run(self):
         outtmpl = os.path.join(self.output_dir, "%(title)s.%(ext)s")
-        cmd = [
-            sys.executable,
-            "-m",
-            "yt_dlp",
-            "--newline",
-            "--ffmpeg-location",
-            FFMPEG_PATH,
-            "-f",
-            "bestvideo+bestaudio/best",
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            outtmpl,
-            self.url,
-        ]
-
         self.progress.emit(0, "Starting…")
-        title = ""
-        dest_path = ""
-        last_error = ""
         last_live_emit = 0.0
 
-        try:
-            if sys.platform == "win32":
-                self._proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            else:
-                self._proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    start_new_session=True,
-                )
-
-            stdout = self._proc.stdout
-            if stdout is None:
-                raise RuntimeError("Could not capture yt-dlp output")
-
-            for line in stdout:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # capture destination filename as title
-                m = _DEST_RE.search(line)
-                if m:
-                    dest_path = m.group(1)
-                    title = Path(dest_path).stem
-
-                # capture .part path for livestreams
-                fm = _FRAG_RE.search(line)
-                if fm:
-                    dest_path = fm.group(1)
-
-                if _ALREADY_RE.search(line):
-                    title = title or self.url
-
-                if _MERGE_RE.search(line):
-                    self.progress.emit(100, "Merging…")
-                    continue
-
-                # parse progress percentage + speed
-                pct_m = _PCT_RE.search(line)
-                if pct_m:
-                    pct = float(pct_m.group(1))
-                    speed_m = _SPEED_RE.search(line)
-                    speed = speed_m.group(1) if speed_m else ""
-                    self.progress.emit(pct, f"Downloading  {speed}")
+        def progress_hook(d):
+            nonlocal last_live_emit
+            if self._cancelled:
+                raise _CancelledError()
+            status = d.get("status", "")
+            if status == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded = d.get("downloaded_bytes", 0)
+                speed_str = (d.get("_speed_str") or "").strip()
+                if total > 0:
+                    pct = downloaded / total * 100
+                    self.progress.emit(pct, f"Downloading  {speed_str}")
                 else:
-                    # livestream: ffmpeg outputs size + time instead of percentage
-                    live_m = _LIVE_RE.search(line)
-                    if live_m:
-                        now = time.monotonic()
-                        if now - last_live_emit < 1.0:
-                            continue
-                        last_live_emit = now
-                        size, time_ = live_m.group(1), live_m.group(2)
-                        self.progress.emit(0, f"Recording {time_}  {size}")
-                    elif line.startswith("ERROR"):
-                        last_error = line
+                    now = time.monotonic()
+                    if now - last_live_emit < 1.0:
+                        return
+                    last_live_emit = now
+                    elapsed = d.get("_elapsed_str", "")
+                    size_str = (d.get("_downloaded_bytes_str") or "").strip()
+                    self.progress.emit(0, f"Recording {elapsed}  {size_str}")
+            elif status == "finished":
+                self.progress.emit(100, "Processing…")
 
-            self._proc.wait()
-            rc = self._proc.returncode
-            self._proc = None
+        def postprocessor_hook(d):
+            if self._cancelled:
+                raise _CancelledError()
+            if d.get("status") == "started":
+                self.progress.emit(100, "Merging…")
 
-            if rc == 0:
-                self.done.emit(True, title or self.url)
-            elif rc < 0 or last_error == "":
-                # killed — rename .part to usable file
-                self._finalize_partial(dest_path)
+        params: dict[str, Any] = {
+            "ffmpeg_location": FFMPEG_PATH,
+            "format": "bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",
+            "outtmpl": outtmpl,
+            "progress_hooks": [progress_hook],
+            "postprocessor_hooks": [postprocessor_hook],
+            "quiet": True,
+            "no_warnings": True,
+        }
+
+        try:
+            with YoutubeDL(cast(Any, params)) as ydl:
+                info = ydl.extract_info(self.url, download=True)
+                title = (info.get("title") if info else None) or self.url
+            self.done.emit(True, title)
+        except _CancelledError:
+            self.done.emit(False, "Stopped")
+        except Exception as e:
+            if self._cancelled:
                 self.done.emit(False, "Stopped")
             else:
-                self.done.emit(False, last_error)
-        except Exception as e:
-            self.done.emit(False, str(e))
+                self.done.emit(False, str(e))
 
 
 class MetadataWorker(QThread):
@@ -248,6 +171,7 @@ class MainWindow(QMainWindow):
         self.resize(940, 480)
 
         self.downloads: list[DownloadItem] = []
+        self._dying_workers: set[QThread] = set()
         self.output_dir = str(Path.home() / "Downloads")
 
         central = QWidget()
@@ -462,19 +386,23 @@ class MainWindow(QMainWindow):
         except Exception:
             traceback.print_exc()
 
+    def _retire_worker(self, worker: QThread):
+        """Keep a Python reference to the worker until its thread fully stops."""
+        self._dying_workers.add(worker)
+        worker.finished.connect(lambda: self._dying_workers.discard(worker))
+        worker.finished.connect(worker.deleteLater)
+
     def _on_finished(self, success: bool, message: str):
         try:
             worker = self.sender()
             if not isinstance(worker, DownloadWorker):
                 return
+            self._retire_worker(worker)
             result = self._find_row_for_worker(worker)
             if result is None:
                 return
             row, item = result
             item.worker = None
-            # Keep a reference until the thread fully stops so Qt doesn't
-            # destroy the QThread while run() is still on the call stack.
-            worker.finished.connect(worker.deleteLater)
 
             title_item = self.table.item(row, self.TITLE_COL)
             status_item = self.table.item(row, self.STATUS_COL)
@@ -506,12 +434,12 @@ class MainWindow(QMainWindow):
             worker = self.sender()
             if not isinstance(worker, MetadataWorker):
                 return
+            self._retire_worker(worker)
             result = self._find_row_for_metadata_worker(worker)
             if result is None:
                 return
             row, item = result
             item.metadata_worker = None
-            worker.finished.connect(worker.deleteLater)
 
             item.title = title
             title_item = self.table.item(row, self.TITLE_COL)
@@ -527,12 +455,12 @@ class MainWindow(QMainWindow):
             worker = self.sender()
             if not isinstance(worker, MetadataWorker):
                 return
+            self._retire_worker(worker)
             result = self._find_row_for_metadata_worker(worker)
             if result is None:
                 return
             row, item = result
             item.metadata_worker = None
-            worker.finished.connect(worker.deleteLater)
             self._set_thumbnail(row, None, f"Preview unavailable: {message}")
         except Exception:
             traceback.print_exc()
@@ -574,6 +502,9 @@ class MainWindow(QMainWindow):
                 item.worker.wait(5000)
             if item.metadata_worker and item.metadata_worker.isRunning():
                 item.metadata_worker.wait(5000)
+        for w in list(self._dying_workers):
+            if w.isRunning():
+                w.wait(5000)
         if a0 is not None:
             a0.accept()
 
