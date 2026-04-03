@@ -286,8 +286,8 @@ class MainWindow(QMainWindow):
     def _start_metadata_fetch(self, item: DownloadItem):
         worker = MetadataWorker(item.url)
         item.metadata_worker = worker
-        worker.loaded.connect(self._on_metadata_loaded)
-        worker.failed.connect(self._on_metadata_failed)
+        worker.loaded.connect(lambda title, data, w=worker: self._on_metadata_loaded(w, title, data))
+        worker.failed.connect(lambda msg, w=worker: self._on_metadata_failed(w, msg))
         worker.start()
 
     def _add_urls(self):
@@ -345,8 +345,8 @@ class MainWindow(QMainWindow):
 
         worker = DownloadWorker(item.url, self.output_dir)
         item.worker = worker
-        worker.progress.connect(self._on_progress)
-        worker.done.connect(self._on_finished)
+        worker.progress.connect(lambda pct, txt, w=worker: self._on_progress(w, pct, txt))
+        worker.done.connect(lambda ok, msg, w=worker: self._on_finished(w, ok, msg))
         worker.start()
 
     def _find_row_for_worker(
@@ -365,11 +365,8 @@ class MainWindow(QMainWindow):
                 return r, item
         return None
 
-    def _on_progress(self, percent: float, status_text: str):
+    def _on_progress(self, worker: DownloadWorker, percent: float, status_text: str):
         try:
-            worker = self.sender()
-            if not isinstance(worker, DownloadWorker):
-                return
             result = self._find_row_for_worker(worker)
             if result is None:
                 return
@@ -398,11 +395,8 @@ class MainWindow(QMainWindow):
         worker.finished.connect(lambda: self._dying_workers.discard(worker))
         worker.finished.connect(worker.deleteLater)
 
-    def _on_finished(self, success: bool, message: str):
+    def _on_finished(self, worker: DownloadWorker, success: bool, message: str):
         try:
-            worker = self.sender()
-            if not isinstance(worker, DownloadWorker):
-                return
             self._retire_worker(worker)
             result = self._find_row_for_worker(worker)
             if result is None:
@@ -435,11 +429,8 @@ class MainWindow(QMainWindow):
         except Exception:
             traceback.print_exc()
 
-    def _on_metadata_loaded(self, title: str, image_data: bytes):
+    def _on_metadata_loaded(self, worker: MetadataWorker, title: str, image_data: bytes):
         try:
-            worker = self.sender()
-            if not isinstance(worker, MetadataWorker):
-                return
             self._retire_worker(worker)
             result = self._find_row_for_metadata_worker(worker)
             if result is None:
@@ -456,11 +447,8 @@ class MainWindow(QMainWindow):
         except Exception:
             traceback.print_exc()
 
-    def _on_metadata_failed(self, message: str):
+    def _on_metadata_failed(self, worker: MetadataWorker, message: str):
         try:
-            worker = self.sender()
-            if not isinstance(worker, MetadataWorker):
-                return
             self._retire_worker(worker)
             result = self._find_row_for_metadata_worker(worker)
             if result is None:
