@@ -1,11 +1,12 @@
 [project]
 name = "yt-dlp-gui"
-version = "0.1.7"
+version = "0.3.0"
 description = "A PyQt6 desktop GUI for yt-dlp with batch downloads and livestream support"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 license = "GPL-3.0-only"
 dependencies = [
+    "certifi",
     "imageio-ffmpeg>=0.6.0",
-    "pyqt6>=6.10",
-    "yt-dlp>=2026.2.4",
+    "pyqt6>=6.7",
+    "yt-dlp>=2025.1.1",
 ]

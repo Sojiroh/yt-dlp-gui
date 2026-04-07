@@ -1,46 +1,67 @@
 import certifi
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
+import traceback
+import urllib.request
+from dataclasses import dataclass, field
 
 # PyInstaller bundles don't include system CA certificates, so SSL
 # verification fails unless we point Python at certifi's bundle.
 if not os.environ.get("SSL_CERT_FILE"):
     os.environ["SSL_CERT_FILE"] = certifi.where()
-import traceback
-import urllib.request
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
-
-import shutil
 
 import imageio_ffmpeg
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
+    QFileDialog,
     QHBoxLayout,
+    QHeaderView,
+    QLabel,
     QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QProgressBar,
-    QFileDialog,
-    QHeaderView,
-    QAbstractItemView,
-    QLabel,
-    QMenu,
-    QMessageBox,
+    QVBoxLayout,
+    QWidget,
 )
 from yt_dlp import YoutubeDL
 
 FFMPEG_PATH = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _fmt_bytes(n: int | float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
+
+
+def _fmt_speed(bps: float) -> str:
+    return f"@ {_fmt_bytes(bps)}/s"
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 _CHATURBOT_RE = re.compile(r"https?://(?:www\.)?chaturbot\.co/")
 
 
@@ -52,52 +73,177 @@ class _CancelledError(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Subprocess tracker – captures ffmpeg processes spawned by each thread
+# so we can terminate them on cancel (yt-dlp delegates livestream
+# downloads to ffmpeg, bypassing Python progress hooks entirely).
+# ---------------------------------------------------------------------------
+
+_subprocess_registry: dict[int, list[subprocess.Popen]] = {}
+_subprocess_lock = threading.Lock()
+_original_Popen_init = subprocess.Popen.__init__
+
+
+def _tracked_Popen_init(self: subprocess.Popen, *args: Any, **kwargs: Any) -> None:
+    _original_Popen_init(self, *args, **kwargs)
+    tid = threading.get_ident()
+    with _subprocess_lock:
+        bucket = _subprocess_registry.get(tid)
+        if bucket is not None:
+            bucket.append(self)
+
+
+subprocess.Popen.__init__ = _tracked_Popen_init  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Workers
+# ---------------------------------------------------------------------------
+
+class _FileMonitor(threading.Thread):
+    """Polls the output directory for growing files and emits size updates."""
+
+    def __init__(self, output_dir: str, callback, interval: float = 0.5):
+        super().__init__(daemon=True)
+        self.output_dir = output_dir
+        self.callback = callback
+        self.interval = interval
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        known: dict[str, int] = {}
+        # snapshot existing files so we only track new ones
+        try:
+            for f in os.listdir(self.output_dir):
+                fp = os.path.join(self.output_dir, f)
+                if os.path.isfile(fp):
+                    known[fp] = -1  # mark as pre-existing (ignore)
+        except OSError:
+            pass
+
+        start = time.monotonic()
+        prev_size = 0
+        prev_time = start
+
+        while not self._stop.wait(self.interval):
+            # find the newest/largest file being written
+            current_file = None
+            current_size = 0
+            try:
+                for f in os.listdir(self.output_dir):
+                    fp = os.path.join(self.output_dir, f)
+                    if not os.path.isfile(fp):
+                        continue
+                    if known.get(fp) == -1:
+                        continue
+                    try:
+                        sz = os.path.getsize(fp)
+                    except OSError:
+                        continue
+                    if sz > current_size:
+                        current_size = sz
+                        current_file = fp
+            except OSError:
+                continue
+
+            if current_file and current_size > 0:
+                now = time.monotonic()
+                elapsed = now - start
+                dt = now - prev_time
+                speed = (current_size - prev_size) / dt if dt > 0 else 0
+                prev_size = current_size
+                prev_time = now
+                self.callback(elapsed, current_size, speed)
+
+
 class DownloadWorker(QThread):
+    MAX_RETRIES = 5
+    RETRY_DELAY = 1.0
+
     progress = pyqtSignal(float, str)  # percent, status_text
-    done = pyqtSignal(bool, str)  # success, message
+    done = pyqtSignal(bool, str)       # success, message
 
     def __init__(self, url: str, output_dir: str):
         super().__init__()
         self.url = url
         self.output_dir = output_dir
         self._cancelled = False
+        self._hook_fired = False
+        self._subprocesses: list[subprocess.Popen] = []
 
     def cancel(self):
         self._cancelled = True
+        for proc in self._subprocesses:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except OSError:
+                pass
+
+    def _do_download(self, params: dict[str, Any]) -> str:
+        with YoutubeDL(cast(Any, params)) as ydl:
+            info = ydl.extract_info(self.url, download=True)
+            return (info.get("title") if info else None) or self.url
 
     def run(self):
+        tid = threading.get_ident()
+        with _subprocess_lock:
+            _subprocess_registry[tid] = self._subprocesses
+
         outtmpl = os.path.join(self.output_dir, "%(title)s.%(ext)s")
         self.progress.emit(0, "Starting…")
         last_live_emit = 0.0
 
-        def progress_hook(d):
+        def progress_hook(d: dict[str, Any]):
             nonlocal last_live_emit
             if self._cancelled:
                 raise _CancelledError()
+
+            self._hook_fired = True
             status = d.get("status", "")
             if status == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 downloaded = d.get("downloaded_bytes", 0)
                 speed_str = (d.get("_speed_str") or "").strip()
+
                 if total > 0:
                     pct = downloaded / total * 100
                     self.progress.emit(pct, f"Downloading  {speed_str}")
                 else:
                     now = time.monotonic()
-                    if now - last_live_emit < 1.0:
+                    if now - last_live_emit < 0.5:
                         return
                     last_live_emit = now
-                    elapsed = d.get("_elapsed_str", "")
-                    size_str = (d.get("_downloaded_bytes_str") or "").strip()
-                    self.progress.emit(0, f"Recording {elapsed}  {size_str}")
+                    size_str = _fmt_bytes(downloaded)
+                    speed = d.get("speed")
+                    speed_part = _fmt_speed(speed) if speed else ""
+                    elapsed = d.get("elapsed")
+                    elapsed_part = _fmt_elapsed(elapsed) if elapsed else ""
+                    info = " ".join(filter(None, [elapsed_part, size_str, speed_part]))
+                    self.progress.emit(0, f"Recording  {info}")
             elif status == "finished":
                 self.progress.emit(100, "Processing…")
 
-        def postprocessor_hook(d):
+        def postprocessor_hook(d: dict[str, Any]):
             if self._cancelled:
                 raise _CancelledError()
             if d.get("status") == "started":
                 self.progress.emit(100, "Merging…")
+
+        def _on_file_monitor(elapsed: float, size: int, speed: float):
+            if self._hook_fired:
+                return
+            elapsed_str = _fmt_elapsed(elapsed)
+            size_str = _fmt_bytes(size)
+            speed_str = _fmt_speed(speed) if speed > 0 else ""
+            info = " ".join(filter(None, [elapsed_str, size_str, speed_str]))
+            self.progress.emit(0, f"Recording  {info}")
+
+        monitor = _FileMonitor(self.output_dir, _on_file_monitor)
+        monitor.start()
 
         params: dict[str, Any] = {
             "ffmpeg_location": FFMPEG_PATH,
@@ -110,22 +256,40 @@ class DownloadWorker(QThread):
             "no_warnings": True,
         }
 
+        attempt = 0
+        last_error = ""
         try:
-            with YoutubeDL(cast(Any, params)) as ydl:
-                info = ydl.extract_info(self.url, download=True)
-                title = (info.get("title") if info else None) or self.url
-            self.done.emit(True, title)
-        except _CancelledError:
-            self.done.emit(False, "Stopped")
-        except Exception as e:
-            if self._cancelled:
-                self.done.emit(False, "Stopped")
-            else:
-                self.done.emit(False, str(e))
+            while attempt <= self.MAX_RETRIES:
+                try:
+                    title = self._do_download(params)
+                    self.done.emit(True, title)
+                    return
+                except _CancelledError:
+                    self.done.emit(False, "Stopped")
+                    return
+                except Exception as e:
+                    if self._cancelled:
+                        self.done.emit(False, "Stopped")
+                        return
+                    attempt += 1
+                    last_error = str(e)
+                    if attempt <= self.MAX_RETRIES:
+                        self.progress.emit(
+                            0,
+                            f"Retrying ({attempt}/{self.MAX_RETRIES})…",
+                        )
+                        time.sleep(self.RETRY_DELAY)
+                        self._hook_fired = False
+
+            self.done.emit(False, f"Failed after {self.MAX_RETRIES} retries: {last_error}")
+        finally:
+            monitor.stop()
+            with _subprocess_lock:
+                _subprocess_registry.pop(tid, None)
 
 
 class MetadataWorker(QThread):
-    loaded = pyqtSignal(str, bytes)
+    loaded = pyqtSignal(str, bytes)  # title, thumbnail_data
     failed = pyqtSignal(str)
 
     def __init__(self, url: str):
@@ -146,13 +310,17 @@ class MetadataWorker(QThread):
             thumbnail_url = info.get("thumbnail") or ""
             thumbnail_data = b""
             if thumbnail_url:
-                with urllib.request.urlopen(thumbnail_url, timeout=15) as response:
-                    thumbnail_data = response.read()
+                with urllib.request.urlopen(thumbnail_url, timeout=15) as resp:
+                    thumbnail_data = resp.read()
 
             self.loaded.emit(title, thumbnail_data)
         except Exception as e:
             self.failed.emit(str(e))
 
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 
 @dataclass
 class DownloadItem:
@@ -163,6 +331,10 @@ class DownloadItem:
     worker: DownloadWorker | None = field(default=None, repr=False)
     metadata_worker: MetadataWorker | None = field(default=None, repr=False)
 
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     THUMBNAIL_COL = 0
@@ -184,11 +356,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # --- Top bar: URL input + buttons ---
+        # --- Top bar ---
         top = QHBoxLayout()
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText(
-            "Paste URL(s) here — one per line for multiple"
+            "Paste URL(s) here \u2014 one per line for multiple"
         )
         self.url_input.returnPressed.connect(self._add_urls)
         top.addWidget(self.url_input, stretch=1)
@@ -197,32 +369,27 @@ class MainWindow(QMainWindow):
         add_btn.clicked.connect(self._add_urls)
         top.addWidget(add_btn)
 
-        folder_btn = QPushButton("Folder…")
+        folder_btn = QPushButton("Folder\u2026")
         folder_btn.clicked.connect(self._pick_folder)
         top.addWidget(folder_btn)
 
         layout.addLayout(top)
 
-        # --- Download table ---
+        # --- Table ---
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
             ["Thumbnail", "Title / URL", "Status", "Progress", "Total Downloaded"]
         )
         header = self.table.horizontalHeader()
         if header is not None:
-            header.setSectionResizeMode(
-                self.THUMBNAIL_COL, QHeaderView.ResizeMode.Fixed
-            )
+            header.setSectionResizeMode(self.THUMBNAIL_COL, QHeaderView.ResizeMode.Fixed)
             header.setSectionResizeMode(self.TITLE_COL, QHeaderView.ResizeMode.Stretch)
-            header.setSectionResizeMode(
-                self.STATUS_COL, QHeaderView.ResizeMode.ResizeToContents
-            )
+            header.setSectionResizeMode(self.STATUS_COL, QHeaderView.ResizeMode.ResizeToContents)
             header.setSectionResizeMode(self.PROGRESS_COL, QHeaderView.ResizeMode.Fixed)
-            header.setSectionResizeMode(
-                self.TOTAL_COL, QHeaderView.ResizeMode.ResizeToContents
-            )
+            header.setSectionResizeMode(self.TOTAL_COL, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(self.THUMBNAIL_COL, 120)
         self.table.setColumnWidth(self.PROGRESS_COL, 180)
+        self.table.setColumnWidth(self.TOTAL_COL, 220)
         vheader = self.table.verticalHeader()
         if vheader is not None:
             vheader.setDefaultSectionSize(72)
@@ -234,6 +401,7 @@ class MainWindow(QMainWindow):
 
         # --- Bottom bar ---
         bottom = QHBoxLayout()
+
         dl_btn = QPushButton("Download All")
         dl_btn.clicked.connect(self._download_all)
         bottom.addWidget(dl_btn)
@@ -250,27 +418,25 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(bottom)
 
-    # ── Actions ──────────────────────────────────────────
+    # ── Helpers ─────────────────────────────────────────
 
     def _build_thumbnail_label(self) -> QLabel:
         label = QLabel("No preview")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("padding: 4px;")
-        label.setToolTip("Loading preview…")
+        label.setToolTip("Loading preview\u2026")
         return label
 
     def _set_thumbnail(self, row: int, image_data: bytes | None, tooltip: str = ""):
         label = self.table.cellWidget(row, self.THUMBNAIL_COL)
         if not isinstance(label, QLabel):
             return
-
         if image_data:
             pixmap = QPixmap()
             if pixmap.loadFromData(image_data):
                 label.setPixmap(
                     pixmap.scaled(
-                        104,
-                        58,
+                        104, 58,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
@@ -278,17 +444,28 @@ class MainWindow(QMainWindow):
                 label.setText("")
                 label.setToolTip(tooltip or "Video thumbnail")
                 return
-
         label.setPixmap(QPixmap())
         label.setText("No preview")
         label.setToolTip(tooltip)
 
-    def _start_metadata_fetch(self, item: DownloadItem):
-        worker = MetadataWorker(item.url)
-        item.metadata_worker = worker
-        worker.loaded.connect(lambda title, data, w=worker: self._on_metadata_loaded(w, title, data))
-        worker.failed.connect(lambda msg, w=worker: self._on_metadata_failed(w, msg))
-        worker.start()
+    def _retire_worker(self, worker: QThread):
+        self._dying_workers.add(worker)
+        worker.finished.connect(lambda: self._dying_workers.discard(worker))
+        worker.finished.connect(worker.deleteLater)
+
+    def _find_row_for_worker(self, worker: DownloadWorker) -> tuple[int, DownloadItem] | None:
+        for r, item in enumerate(self.downloads):
+            if item.worker is worker:
+                return r, item
+        return None
+
+    def _find_row_for_metadata_worker(self, worker: MetadataWorker) -> tuple[int, DownloadItem] | None:
+        for r, item in enumerate(self.downloads):
+            if item.metadata_worker is worker:
+                return r, item
+        return None
+
+    # ── Actions ─────────────────────────────────────────
 
     def _add_urls(self):
         text = self.url_input.text().strip()
@@ -304,9 +481,7 @@ class MainWindow(QMainWindow):
             self.downloads.append(item)
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self.table.setCellWidget(
-                row, self.THUMBNAIL_COL, self._build_thumbnail_label()
-            )
+            self.table.setCellWidget(row, self.THUMBNAIL_COL, self._build_thumbnail_label())
             self.table.setItem(row, self.TITLE_COL, QTableWidgetItem(url))
             self.table.setItem(row, self.STATUS_COL, QTableWidgetItem("Pending"))
             bar = QProgressBar()
@@ -316,29 +491,34 @@ class MainWindow(QMainWindow):
             self._start_metadata_fetch(item)
         self.url_input.clear()
 
+    def _start_metadata_fetch(self, item: DownloadItem):
+        worker = MetadataWorker(item.url)
+        item.metadata_worker = worker
+        worker.loaded.connect(lambda title, data, w=worker: self._on_metadata_loaded(w, title, data))
+        worker.failed.connect(lambda msg, w=worker: self._on_metadata_failed(w, msg))
+        worker.start()
+
     def _pick_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose download folder", self.output_dir
-        )
+        folder = QFileDialog.getExistingDirectory(self, "Choose download folder", self.output_dir)
         if folder:
             self.output_dir = folder
 
     def _download_all(self):
         for row, item in enumerate(self.downloads):
-            if item.status == "Pending" or item.status == "Error":
+            if item.status in ("Pending", "Error"):
                 self._start_download(row)
 
     def _start_download(self, row: int):
         item = self.downloads[row]
-        item.status = "Starting…"
+        item.status = "Starting\u2026"
         item.percent = 0
+
         status_item = self.table.item(row, self.STATUS_COL)
         if status_item:
-            status_item.setText("Starting…")
+            status_item.setText("Starting\u2026")
         bar = self.table.cellWidget(row, self.PROGRESS_COL)
-        if not isinstance(bar, QProgressBar):
-            return
-        bar.setValue(0)
+        if isinstance(bar, QProgressBar):
+            bar.setValue(0)
         total_item = self.table.item(row, self.TOTAL_COL)
         if total_item:
             total_item.setText("")
@@ -349,21 +529,42 @@ class MainWindow(QMainWindow):
         worker.done.connect(lambda ok, msg, w=worker: self._on_finished(w, ok, msg))
         worker.start()
 
-    def _find_row_for_worker(
-        self, worker: DownloadWorker
-    ) -> tuple[int, DownloadItem] | None:
-        for r, item in enumerate(self.downloads):
-            if item.worker is worker:
-                return r, item
-        return None
+    def _stop_all(self):
+        for item in self.downloads:
+            if item.worker and item.worker.isRunning():
+                item.worker.cancel()
 
-    def _find_row_for_metadata_worker(
-        self, worker: MetadataWorker
-    ) -> tuple[int, DownloadItem] | None:
-        for r, item in enumerate(self.downloads):
-            if item.metadata_worker is worker:
-                return r, item
-        return None
+    def _stop_download(self, row: int):
+        item = self.downloads[row]
+        if item.worker and item.worker.isRunning():
+            item.worker.cancel()
+
+    def _clear_finished(self):
+        rows_to_remove = [r for r, item in enumerate(self.downloads) if item.status == "Done"]
+        for row in reversed(rows_to_remove):
+            self.table.removeRow(row)
+            self.downloads.pop(row)
+
+    def _remove_row(self, row: int):
+        item = self.downloads[row]
+        if item.worker and item.worker.isRunning():
+            QMessageBox.warning(self, "Busy", "Cannot remove an active download.")
+            return
+        if item.metadata_worker and item.metadata_worker.isRunning():
+            QMessageBox.warning(self, "Busy", "Cannot remove while preview is loading.")
+            return
+        self.table.removeRow(row)
+        self.downloads.pop(row)
+
+    def _open_folder(self):
+        if sys.platform == "win32":
+            os.startfile(self.output_dir)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", self.output_dir])
+        else:
+            subprocess.Popen(["xdg-open", self.output_dir])
+
+    # ── Callbacks ───────────────────────────────────────
 
     def _on_progress(self, worker: DownloadWorker, percent: float, status_text: str):
         try:
@@ -380,20 +581,12 @@ class MainWindow(QMainWindow):
             if not status_item or not speed_item or not isinstance(bar, QProgressBar):
                 return
 
-            status_item.setText(status_text.split("  ")[0])
-            bar.setValue(int(percent))
-            # speed is after the double-space
             parts = status_text.split("  ")
-            speed = parts[1] if len(parts) > 1 else ""
-            speed_item.setText(speed)
+            status_item.setText(parts[0])
+            bar.setValue(int(percent))
+            speed_item.setText(parts[1] if len(parts) > 1 else "")
         except Exception:
             traceback.print_exc()
-
-    def _retire_worker(self, worker: QThread):
-        """Keep a Python reference to the worker until its thread fully stops."""
-        self._dying_workers.add(worker)
-        worker.finished.connect(lambda: self._dying_workers.discard(worker))
-        worker.finished.connect(worker.deleteLater)
 
     def _on_finished(self, worker: DownloadWorker, success: bool, message: str):
         try:
@@ -408,6 +601,7 @@ class MainWindow(QMainWindow):
             status_item = self.table.item(row, self.STATUS_COL)
             speed_item = self.table.item(row, self.TOTAL_COL)
             bar = self.table.cellWidget(row, self.PROGRESS_COL)
+
             if not title_item or not status_item or not speed_item:
                 return
 
@@ -437,8 +631,8 @@ class MainWindow(QMainWindow):
                 return
             row, item = result
             item.metadata_worker = None
-
             item.title = title
+
             title_item = self.table.item(row, self.TITLE_COL)
             if title_item:
                 title_item.setText(title)
@@ -459,13 +653,7 @@ class MainWindow(QMainWindow):
         except Exception:
             traceback.print_exc()
 
-    def _clear_finished(self):
-        rows_to_remove = [
-            r for r, item in enumerate(self.downloads) if item.status == "Done"
-        ]
-        for row in reversed(rows_to_remove):
-            self.table.removeRow(row)
-            self.downloads.pop(row)
+    # ── Context menu ────────────────────────────────────
 
     def _context_menu(self, pos):
         row = self.table.rowAt(pos.y())
@@ -473,6 +661,7 @@ class MainWindow(QMainWindow):
             return
         item = self.downloads[row]
         menu = QMenu(self)
+
         if item.worker and item.worker.isRunning():
             menu.addAction("Stop", lambda: self._stop_download(row))
         if item.status in ("Error", "Pending", "Stopped"):
@@ -481,13 +670,14 @@ class MainWindow(QMainWindow):
             menu.addAction("Retry", lambda: self._start_download(row))
             menu.addAction("Open file location", lambda: self._open_folder())
         menu.addAction("Remove", lambda: self._remove_row(row))
+
         viewport = self.table.viewport()
         if viewport is not None:
             menu.exec(viewport.mapToGlobal(pos))
 
+    # ── Shutdown ────────────────────────────────────────
+
     def closeEvent(self, a0: QCloseEvent | None):
-        # Stop all running workers and wait for them to finish so QThread
-        # objects are not destroyed while still running (causes segfault).
         for item in self.downloads:
             if item.worker and item.worker.isRunning():
                 item.worker.cancel()
@@ -501,37 +691,6 @@ class MainWindow(QMainWindow):
                 w.wait(5000)
         if a0 is not None:
             a0.accept()
-
-    def _open_folder(self):
-        if sys.platform == "win32":
-            os.startfile(self.output_dir)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", self.output_dir])
-        else:
-            subprocess.Popen(["xdg-open", self.output_dir])
-
-    def _stop_download(self, row: int):
-        item = self.downloads[row]
-        if item.worker and item.worker.isRunning():
-            item.worker.cancel()
-
-    def _stop_all(self):
-        for item in self.downloads:
-            if item.worker and item.worker.isRunning():
-                item.worker.cancel()
-
-    def _remove_row(self, row: int):
-        item = self.downloads[row]
-        if item.worker and item.worker.isRunning():
-            QMessageBox.warning(self, "Busy", "Cannot remove an active download.")
-            return
-        if item.metadata_worker and item.metadata_worker.isRunning():
-            QMessageBox.warning(
-                self, "Busy", "Cannot remove an item while its preview is loading."
-            )
-            return
-        self.table.removeRow(row)
-        self.downloads.pop(row)
 
 
 def _excepthook(exc_type, exc_value, exc_tb):
