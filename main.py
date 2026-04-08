@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
 from yt_dlp import YoutubeDL
 
 FFMPEG_PATH = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+_VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".ts", ".flv", ".avi", ".mov"}
 
 
 def _fmt_bytes(n: int | float) -> str:
@@ -188,6 +189,90 @@ class DownloadWorker(QThread):
             info = ydl.extract_info(self.url, download=True)
             return (info.get("title") if info else None) or self.url
 
+    @staticmethod
+    def _snapshot_dir(directory: str) -> set[str]:
+        try:
+            return set(os.listdir(directory))
+        except OSError:
+            return set()
+
+    @staticmethod
+    def _find_new_media(directory: str, before: set[str]) -> str | None:
+        """Find a new video file that appeared since *before* snapshot.
+
+        Also considers ``.part`` files whose base name has a video extension,
+        since yt-dlp / ffmpeg may leave stream content inside a ``.part`` file
+        when the connection drops.
+        """
+        try:
+            after = set(os.listdir(directory))
+        except OSError:
+            return None
+
+        best: str | None = None
+        best_size = 0
+        for name in sorted(after - before):
+            # Check plain video files first
+            base, ext = os.path.splitext(name)
+            if ext == ".part":
+                # e.g. "title.mp4.part" → check if "title.mp4" has a video ext
+                _, inner_ext = os.path.splitext(base)
+                is_video = inner_ext.lower() in _VIDEO_EXTS
+            else:
+                is_video = ext.lower() in _VIDEO_EXTS
+
+            if not is_video:
+                continue
+            full = os.path.join(directory, name)
+            try:
+                sz = os.path.getsize(full) if os.path.isfile(full) else 0
+            except OSError:
+                continue
+            if sz > best_size:
+                best = full
+                best_size = sz
+        return best
+
+    @staticmethod
+    def _concat_parts(parts: list[str], output: str) -> bool:
+        """Concatenate *parts* into *output* using ffmpeg concat demuxer."""
+        if len(parts) < 2:
+            return False
+        list_file = output + ".concat.txt"
+        temp_out = output + ".merging.mp4"
+        try:
+            with open(list_file, "w") as f:
+                for p in parts:
+                    escaped = p.replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
+            subprocess.run(
+                [FFMPEG_PATH, "-y", "-f", "concat", "-safe", "0",
+                 "-i", list_file, "-c", "copy", temp_out],
+                check=True, capture_output=True,
+            )
+            for p in parts:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            if os.path.exists(output):
+                os.remove(output)
+            os.rename(temp_out, output)
+            return True
+        except Exception:
+            # Cleanup temp files on failure; keep the parts so nothing is lost
+            for tmp in (list_file, temp_out):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return False
+        finally:
+            try:
+                os.remove(list_file)
+            except OSError:
+                pass
+
     def run(self):
         tid = threading.get_ident()
         with _subprocess_lock:
@@ -196,11 +281,17 @@ class DownloadWorker(QThread):
         outtmpl = os.path.join(self.output_dir, "%(title)s.%(ext)s")
         self.progress.emit(0, "Starting…")
         last_live_emit = 0.0
+        own_files: set[str] = set()          # files this download touches
 
         def progress_hook(d: dict[str, Any]):
             nonlocal last_live_emit
             if self._cancelled:
                 raise _CancelledError()
+
+            # Track every file yt-dlp reports for this download
+            fn = d.get("filename")
+            if fn:
+                own_files.add(fn)
 
             self._hook_fired = True
             status = d.get("status", "")
@@ -254,14 +345,36 @@ class DownloadWorker(QThread):
             "postprocessor_hooks": [postprocessor_hook],
             "quiet": True,
             "no_warnings": True,
+            # Stream / fragment resilience
+            "retries": 10,
+            "fragment_retries": 10,
+            "skip_unavailable_fragments": True,
+            "extractor_retries": 5,
+            # ffmpeg reconnect flags for HLS/direct streams
+            "external_downloader_args": {
+                "ffmpeg_i": [
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "300",
+                ],
+            },
         }
 
         attempt = 0
         last_error = ""
+        partial_files: list[str] = []
         try:
             while attempt <= self.MAX_RETRIES:
+                before = self._snapshot_dir(self.output_dir)
                 try:
                     title = self._do_download(params)
+                    # Success – merge with earlier partial files if any
+                    if partial_files:
+                        final = self._find_new_media(self.output_dir, before)
+                        if final:
+                            partial_files.append(final)
+                            self.progress.emit(100, "Merging parts…")
+                            self._concat_parts(partial_files, final)
                     self.done.emit(True, title)
                     return
                 except _CancelledError:
@@ -271,6 +384,15 @@ class DownloadWorker(QThread):
                     if self._cancelled:
                         self.done.emit(False, "Stopped")
                         return
+                    # Save partial file from this failed attempt
+                    partial = self._find_new_media(self.output_dir, before)
+                    if partial:
+                        renamed = f"{partial}.part_{len(partial_files):03d}"
+                        try:
+                            os.rename(partial, renamed)
+                            partial_files.append(renamed)
+                        except OSError:
+                            pass
                     attempt += 1
                     last_error = str(e)
                     if attempt <= self.MAX_RETRIES:
@@ -281,9 +403,28 @@ class DownloadWorker(QThread):
                         time.sleep(self.RETRY_DELAY)
                         self._hook_fired = False
 
-            self.done.emit(False, f"Failed after {self.MAX_RETRIES} retries: {last_error}")
+            # All retries exhausted – merge whatever parts we collected
+            if partial_files:
+                self.progress.emit(100, "Merging partial downloads…")
+                output = partial_files[0].rsplit(".part_", 1)[0]
+                if self._concat_parts(partial_files, output):
+                    title = os.path.splitext(os.path.basename(output))[0]
+                    self.done.emit(True, title)
+                else:
+                    self.done.emit(False, f"Failed after {self.MAX_RETRIES} retries: {last_error}")
+            else:
+                self.done.emit(False, f"Failed after {self.MAX_RETRIES} retries: {last_error}")
         finally:
             monitor.stop()
+            # Clean up .part leftovers that belong to THIS download only
+            saved = set(partial_files)
+            for fp in own_files:
+                part = fp + ".part" if not fp.endswith(".part") else fp
+                if part not in saved:
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
             with _subprocess_lock:
                 _subprocess_registry.pop(tid, None)
 
